@@ -1,0 +1,13 @@
+[Unit]
+Description=Aurify Mongo->Postgres sync (SAAS)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=mdb-pdb-sync
+WorkingDirectory=/opt/mdb_pdb_sync
+ExecStart=/opt/mdb_pdb_sync/venv/bin/python saas.py
+# PrivateTmp is intentionally left unset: common_sync.py's overlap lock file
+# lives in the shared temp dir and must be visible across consecutive runs
+# of this timer.
