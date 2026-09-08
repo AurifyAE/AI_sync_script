@@ -162,7 +162,9 @@ FIELD_NAME_OVERRIDES = {
         "type": "type_id",
         "typeId": "type_id",
         "country": "country_id",
-        "countryId": "country_id"
+        "countryId": "country_id",
+        "karat": "karat_id",
+        "karatId": "karat_id",
     },
     "transactions": {
         "branch": "branch_id",
