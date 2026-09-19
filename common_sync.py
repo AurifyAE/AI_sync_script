@@ -50,7 +50,7 @@ PG_DATABASE = None
 PG_USER     = None
 PG_PASSWORD = None
 
-SYNC_WINDOW_MINUTES = 2880
+SYNC_WINDOW_MINUTES = 180
 BATCH_SIZE          = 500
 LOCK_STALE_SECONDS  = 3600
 EXCLUDE_TABLES      = []
@@ -680,13 +680,23 @@ def sync_collection(
         id_is_int = pg_columns_schema.get("id") in ['integer', 'bigint']
         overrides = FIELD_NAME_OVERRIDES.get(pg_table_name, {})
 
-        if INITIAL_RUN or pg_table_name == "transactions":
+        if INITIAL_RUN:
             mongo_query = {}
         else:
-            timestamp_col = "updated_at" if "updated_at" in pg_columns_schema else ("created_at" if "created_at" in pg_columns_schema else "sync_at")
-            pg_cursor.execute(f'SELECT MAX("{timestamp_col}") FROM "{pg_table_name}";')
+            timestamp_col = "updated_at" if "updated_at" in pg_columns_schema else (
+                "created_at" if "created_at" in pg_columns_schema else "sync_at"
+            )
+
+            pg_cursor.execute(
+                f'SELECT MAX("{timestamp_col}") FROM "{pg_table_name}";'
+            )
             last_sync = pg_cursor.fetchone()[0]
-            mongo_query = {"updatedAt": {"$gte": last_sync}} if last_sync else default_cron_query
+
+            if last_sync:
+                safe_last_sync = last_sync - timedelta(minutes=5)
+                mongo_query = {"updatedAt": {"$gte": safe_last_sync}}
+            else:
+                mongo_query = default_cron_query
 
         mongo_cursor = mongo_db[mongo_collection_name].find(mongo_query)
         all_docs = []
@@ -1217,6 +1227,7 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
                 "vat_status": vat_stat,
                 "vat_number": vat_num,
                 "trade_license_number": trade_lic,
+                "status": doc.get("status"),
                 "is_active": doc.get("isActive", True),
                 "is_deleted": doc.get("isDeleted", False),
                 "sync_at": datetime.now(timezone.utc)
@@ -1233,6 +1244,7 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
         sql = f'INSERT INTO "accounts" ({columns_str}) VALUES %s ON CONFLICT (id) DO UPDATE SET {update_str};'
         
         batch = [tuple(r.get(c) for c in managed_columns) for r in all_rows]
+        pg_cursor.execute("SET LOCAL app.skip_account_reporting = 'on';")
         execute_values(pg_cursor, sql, batch, page_size=BATCH_SIZE)
         pg_conn.commit()
         logger.info(f"  [accounts] Custom sync finished: {len(all_rows)} records processed.")
@@ -1302,6 +1314,11 @@ def sync_company_accounts_custom(mongo_db, pg_conn, default_cron_query):
                 "company_email": doc.get("companyEmail"),
                 "company_phone1": doc.get("companyPhone1"),
                 "account_status": doc.get("accountStatus"),
+                "organization_id": to_str_id(doc.get("organizationId")),
+                "branch_id": to_str_id(doc.get("branchId")),
+                "is_party": doc.get("isParty", False),
+                "party_id": to_str_id(doc.get("partyId")),
+                "created_by": to_str_id(doc.get("createdBy")),
                 
                 # Compliance Fixes
                 "kyc_trade_license": trade_lic,
@@ -1742,6 +1759,41 @@ def sync_user_branch_roles(mongo_db, pg_conn):
         pg_cursor.close()
 
 
+def refresh_postgres_reports(pg_conn):
+    """Shared by the frequent fetch job and daily deletion job. Return success."""
+    refresh_functions = [
+        "refresh_ai_tables()", "refresh_ai_own_stock_position()",
+        "refresh_reg_tables()", "refresh_monthly_summary()",
+        "check_ml_retrain_needed()", "refresh_deal_strategy_tables()",
+        "refresh_inventory_view()", "refresh_risk_dashboard_currency_breakdown()",
+        "refresh_party_cancellation_stats()", "refresh_party_branch_org_balances()",
+        "refresh_extended_reporting_tables()",
+    ]
+    failed = False
+    try:
+        with pg_conn.cursor() as cursor:
+            logger.info("Truncating snapshot tables...")
+            cursor.execute('TRUNCATE TABLE "ai_stock_ledger" RESTART IDENTITY;')
+            cursor.execute('TRUNCATE TABLE "ai_user_permissions" RESTART IDENTITY;')
+            pg_conn.commit()
+            for fn in refresh_functions:
+                try:
+                    logger.info("Executing: SELECT %s;", fn)
+                    cursor.execute(f"SELECT {fn};")
+                    pg_conn.commit()
+                except Exception:
+                    pg_conn.rollback()
+                    failed = True
+                    logger.exception("Failed to execute %s", fn)
+    except Exception:
+        pg_conn.rollback()
+        failed = True
+        logger.exception("Post-sync database refresh functions FAILED")
+    if not failed:
+        logger.info("All AI analytics completed successfully.")
+    return not failed
+
+
 def run_migration(name, mongo_uri, mongo_db_name, pg_host, pg_port, pg_database,
                    pg_user, pg_password, initial_run=False, sync_window_minutes=None):
     """
@@ -1825,44 +1877,10 @@ def run_migration(name, mongo_uri, mongo_db_name, pg_host, pg_port, pg_database,
 
         logger.info("-" * 60)
         logger.info("Executing mandatory PostgreSQL refresh functions...")
-        try:
-            pg_cursor = pg_conn.cursor()
-            logger.info("Truncating snapshot tables...")
-            pg_cursor.execute('TRUNCATE TABLE "ai_stock_ledger" RESTART IDENTITY;')
-            pg_cursor.execute('TRUNCATE TABLE "ai_user_permissions" RESTART IDENTITY;')
-            pg_conn.commit()
-
-            refresh_functions = [
-                "refresh_ai_tables()",
-                "refresh_ai_own_stock_position()",
-                "refresh_reg_tables()",
-                "refresh_monthly_summary()",
-                "check_ml_retrain_needed()",
-                "refresh_deal_strategy_tables()",
-                "refresh_inventory_view()",
-                "refresh_risk_dashboard_currency_breakdown()",
-                "refresh_party_cancellation_stats()",
-                "refresh_party_branch_org_balances()",
-                "refresh_extended_reporting_tables()"
-            ]
-
-            for fn in refresh_functions:
-                try:
-                    logger.info(f"Executing: SELECT {fn};")
-                    pg_cursor.execute(f"SELECT {fn};")
-                    pg_conn.commit()
-                except Exception as fn_err:
-                    pg_conn.rollback()
-                    logger.error(f"Failed to execute {fn}: {fn_err}")
-
-            pg_conn.commit()
-            pg_cursor.close()
-            logger.info("All AI analytics completed successfully.")
-        except Exception as e:
-            pg_conn.rollback()
-            logger.error(f"Post-sync database refresh functions FAILED: {e}")
-
-        logger.info("Migration completed successfully.")
+        if refresh_postgres_reports(pg_conn):
+            logger.info("Migration completed successfully.")
+        else:
+            logger.warning("Migration finished with report refresh errors; review the logs.")
 
     except Exception:
         logger.exception("Migration FAILED with an unexpected error.")

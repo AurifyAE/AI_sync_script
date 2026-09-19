@@ -18,10 +18,10 @@ if __name__ == "__main__":
         uat.run()
     except Exception as e:
         logger.exception("UAT sync failed")
-    # logger.info("=== Starting saas sync ===")
-    # try:
-    #     saas.run()
-    # except Exception as e:
-    #     logger.exception("SAAS sync failed")
+    logger.info("=== Starting saas sync ===")
+    try:
+        saas.run()
+    except Exception as e:
+        logger.exception("SAAS sync failed")
 
     logger.info("=== Both syncs finished ===")
