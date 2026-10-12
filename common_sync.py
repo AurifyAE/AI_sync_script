@@ -382,6 +382,31 @@ NESTED_ARRAY_SYNC_CONFIG = {
             "description": "description"
         }
     },
+    "metal_opening_entries": {
+        "mongo_collection": "metalopenings",
+        "array_path": ["entries"],
+        "parent_fk_column": "opening_id",
+        "conflict_target": "id",
+        "mappings": {
+            "metal_id": "metalId",
+            "division_id": "division",
+            "division_code": "divisionCode",
+            "division_label": "divisionLabel",
+            "item_name": "itemName",
+            "gross_weight": "grossWeight",
+            "pieces": "pieces",
+            "purity": "purity",
+            "pure_weight": "pureWeight",
+            "avg_making_rate": "avgMakingRate",
+            "avg_making_amount": "avgMakingAmount",
+            "metal_rate_type_id": "metalRateType",
+            "rate": "rate",
+            "pcs": "pcs",
+            "pcs_count": "pcsCount",
+            "total_value": "totalValue",
+            "metal_amount": "metalAmount"
+        }
+    },
     "transaction_fixing_orders": {
         "mongo_collection": "transactionfixings",
         "array_path": ["orders"],
