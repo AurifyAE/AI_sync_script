@@ -13,6 +13,8 @@ import psycopg2
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
+import sync_monitor
+
 _log_handler = logging.StreamHandler(sys.stdout)
 logging.basicConfig(
     level=logging.INFO,
@@ -50,7 +52,8 @@ PG_DATABASE = None
 PG_USER     = None
 PG_PASSWORD = None
 
-SYNC_WINDOW_MINUTES = 180
+# Fallback window only (no saved last-success yet); see sync_monitor.py.
+SYNC_WINDOW_MINUTES = 30
 BATCH_SIZE          = 500
 LOCK_STALE_SECONDS  = 3600
 EXCLUDE_TABLES      = []
@@ -67,6 +70,10 @@ SPECIAL_TABLES = {
     "metal_transaction_items", "role_permissions", "user_branch_roles", 
     "divisions", "branches", "stock_buffers", "accounts", "company_accounts","organizations", "opportunity_stage_history"
     }
+
+# Masters where branchId null means an org-level record; keep branch_id NULL
+# instead of filling the org's default branch.
+ORG_LEVEL_TABLES = {"voucher_masters"}
 
 
 FIELD_NAME_OVERRIDES = {
@@ -828,7 +835,8 @@ def sync_collection(
                 if org:
                     row_data["organization_id"] = org
 
-            if "branch_id" in pg_columns_schema and not row_data.get("branch_id") and row_data.get("organization_id"):
+            if ("branch_id" in pg_columns_schema and not row_data.get("branch_id")
+                    and row_data.get("organization_id") and pg_table_name not in ORG_LEVEL_TABLES):
                 branch = org_to_branch.get(row_data["organization_id"])
                 if branch:
                     row_data["branch_id"] = branch
@@ -1864,18 +1872,27 @@ def run_migration(name, mongo_uri, mongo_db_name, pg_host, pg_port, pg_database,
         acquire_lock(lock_file)
     except SyncAlreadyRunningError as e:
         logger.warning(str(e))
+        sync_monitor.alert_if_lock_stuck(name, lock_file, LOCK_STALE_SECONDS, e)
         return
     except Exception as e:
         logger.error(f"Could not acquire lock: {e}")
+        sync_monitor.send_failure_alert(name, [f"Could not acquire lock: {e}"])
         return
+
+    error_collector = sync_monitor.ErrorCollector(logger)
 
     mongo_client = None
     pg_conn = None
+    run_started = datetime.now(timezone.utc)
     try:
-        time_filter = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        time_filter = sync_monitor.get_sync_time_filter(name, run_started, window_minutes)
+        logger.info(f"Fetching Mongo changes since {time_filter.isoformat()}")
         default_cron_query = {"updatedAt": {"$gte": time_filter}}
 
-        mongo_client = MongoClient(mongo_uri, datetime_conversion='DATETIME_AUTO', serverSelectionTimeoutMS=10000)
+        mongo_client = MongoClient(
+            mongo_uri, datetime_conversion='DATETIME_AUTO',
+            serverSelectionTimeoutMS=10000, connectTimeoutMS=10000, socketTimeoutMS=300000,
+        )
         mongo_db = mongo_client[mongo_db_name]
         mongo_collections_map = {n.lower().replace("_", ""): n for n in mongo_db.list_collection_names()}
 
@@ -1938,5 +1955,6 @@ def run_migration(name, mongo_uri, mongo_db_name, pg_host, pg_port, pg_database,
             pg_conn.close()
         if mongo_client is not None:
             mongo_client.close()
+        sync_monitor.finish_run(name, run_started, error_collector)
         release_lock(lock_file)
         _CURRENT_INSTANCE = "default"
