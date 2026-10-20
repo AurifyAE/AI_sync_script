@@ -68,7 +68,8 @@ def get_lock_file(name: str) -> str:
 
 SPECIAL_TABLES = {
     "metal_transaction_items", "role_permissions", "user_branch_roles", 
-    "divisions", "branches", "stock_buffers", "accounts", "company_accounts","organizations", "opportunity_stage_history"
+    "divisions", "branches", "stock_buffers", "accounts", "company_accounts","organizations", "opportunity_stage_history",
+    "stock_adjustments", "stock_adjustment_items"
     }
 
 # Masters where branchId null means an org-level record; keep branch_id NULL
@@ -87,7 +88,8 @@ FIELD_NAME_OVERRIDES = {
         "currencyCode": "currency_code",
         "organizationId": "organization_id",
         "OrganizationId": "organization_id",
-        "branchId": "branch_id"
+        "branchId": "branch_id",
+        "isPOS": "is_pos"
     },
     "fixing_prices": {
         "transaction": "transaction_id",
@@ -411,7 +413,8 @@ NESTED_ARRAY_SYNC_CONFIG = {
             "pcs": "pcs",
             "pcs_count": "pcsCount",
             "total_value": "totalValue",
-            "metal_amount": "metalAmount"
+            "metal_amount": "metalAmount",
+            "metal_cost_amount": "metalCostAmount"
         }
     },
     "transaction_fixing_orders": {
@@ -810,6 +813,32 @@ def sync_collection(
                     if "emirates_id" in pg_columns_schema and kyc_obj.get("emiratesId"):
                         row_data["emirates_id"] = kyc_obj.get("emiratesId")
 
+            # Draft (DM) item details live in labReportAndParty, same as the ERP Draft page.
+            if pg_table_name == "draftings":
+                lab = doc.get("labReportAndParty") or {}
+                if isinstance(lab, dict):
+                    purity = clean_and_serialize(lab.get("purity"), "numeric")
+                    purchase_type = lab.get("purchaseType")
+                    draft_fields = {
+                        "purchase_type": purchase_type,
+                        # metalReceipt -> Metal Receipt (voucher_type is always DRAFT)
+                        "transaction_type": re.sub(r'(?<!^)(?=[A-Z])', ' ', purchase_type).title() if purchase_type else None,
+                        "stock_id": to_str_id(lab.get("stockId")),
+                        "stock_code": lab.get("stockCode"),
+                        "division_id": to_str_id(lab.get("division")),
+                        "division_code": lab.get("divisionCode"),
+                        "gross_weight": clean_and_serialize(lab.get("grossWeight"), "numeric"),
+                        "purity": purity,
+                        "pure_weight": clean_and_serialize(lab.get("pureWeight"), "numeric"),
+                        # Page shows purity * 24 (0.995 -> 23.88); lab "karat" holds codes like "995".
+                        "karat": round(purity * 24, 2) if purity else None,
+                        "metal_value": clean_and_serialize(lab.get("metalValue"), "numeric"),
+                        "currency_code": lab.get("partyCurrencyCode"),
+                    }
+                    for col, val in draft_fields.items():
+                        if col in pg_columns_schema:
+                            row_data[col] = val
+
             # 2. GENERAL FIELD MAPPING LOOP
             for key, value in doc.items():
                 if key == "_id":
@@ -931,13 +960,24 @@ def sync_branches_custom(mongo_db, pg_conn, default_cron_query):
                 "address_emirate": addr.get("emirate"),
                 "address_country": addr.get("country"),
                 "address_po_box": addr.get("poBox"),
+                # Stored as UTC midnight of the Dubai date; keep the Dubai (UTC+4) date.
+                "branch_opening_date": (
+                    (clean_and_serialize(doc.get("branchOpeningDate")) + timedelta(hours=4)).date()
+                    if isinstance(clean_and_serialize(doc.get("branchOpeningDate")), datetime) else None
+                ),
+                "is_hedged": bool(doc.get("isHedged") or doc.get("isHedge") or doc.get("hedging")),
+                "gold_oz_conversion": clean_and_serialize(doc.get("goldOzConversion"), 'numeric') or 31.1035,
+                "amount_decimal": doc.get("amountDecimal") if doc.get("amountDecimal") is not None else 2,
+                "metal_decimal": doc.get("metalDecimal") if doc.get("metalDecimal") is not None else 3,
                 "sync_at": datetime.now(timezone.utc),
             }
             all_rows.append(row_data)
 
         if not all_rows: return
 
-        managed_columns = list(all_rows[0].keys())
+        # Skip columns not in the table yet (e.g. before sql/trading_reports_columns.sql is run).
+        pg_columns_schema = _get_columns_schema(pg_cursor, "branches")
+        managed_columns = [c for c in all_rows[0].keys() if c in pg_columns_schema]
         columns_str = ", ".join([f'"{c}"' for c in managed_columns])
         update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in managed_columns if c not in ("id", "created_at", "sync_at")])
         sql = f'INSERT INTO "branches" ({columns_str}) VALUES %s ON CONFLICT (id) DO UPDATE SET {update_str};'
@@ -966,6 +1006,11 @@ def sync_divisions_custom(mongo_db, pg_conn, default_cron_query):
                 "organization_id": to_str_id(doc.get("OrganizationId")),
                 "branch_id": to_str_id(doc.get("branchId")),
                 "is_active": doc.get("isActive", True),
+                "account_id": to_str_id(doc.get("accountId")),
+                "purchase_expense_account_id": to_str_id(doc.get("purchaseExpenseAccountId")),
+                "sales_income_account_id": to_str_id(doc.get("salesIncomeAccountId")),
+                "fixing_hedge_purchase_account_id": to_str_id(doc.get("fixingHedgePurchaseAccountId")),
+                "fixing_hedge_sale_account_id": to_str_id(doc.get("fixingHedgeSaleAccountId")),
                 "sync_at": datetime.now(timezone.utc),
             }
             all_rows.append(row_data)
@@ -974,7 +1019,9 @@ def sync_divisions_custom(mongo_db, pg_conn, default_cron_query):
             logger.info("  [divisions] No new/updated records in this window.")
             return
 
-        managed_columns = list(all_rows[0].keys())
+        # Skip columns not in the table yet (e.g. before sql/trading_reports_columns.sql is run).
+        pg_columns_schema = _get_columns_schema(pg_cursor, "divisions")
+        managed_columns = [c for c in all_rows[0].keys() if c in pg_columns_schema]
         columns_str = ", ".join([f'"{c}"' for c in managed_columns])
         update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in managed_columns if c not in ("id", "created_at", "sync_at")])
         sql = f'INSERT INTO "divisions" ({columns_str}) VALUES %s ON CONFLICT (id) DO UPDATE SET {update_str};'
@@ -1504,6 +1551,7 @@ def sync_metal_transactions(mongo_db, pg_conn, default_cron_query):
                 # Flags
                 "is_fixed": bool(is_fixed),
                 "is_hedge": bool(is_hedge),
+                "is_unfix": bool(tx.get("unfix") or tx.get("isUnfix")),
                 "is_deleted": bool(is_deleted),
                 
                 # Foreign Keys
@@ -1742,6 +1790,179 @@ def sync_metal_transaction_items(mongo_db, pg_conn, default_cron_query, initial_
         pg_cursor.close()
 
 
+def _build_stock_adjustment_rows(doc, branch_to_org, org_to_branch, salesman_names, account_codes, now):
+    """One header row + one row per fromItems/toItems entry (account-only rows
+    included; they never get an inventory_logs entry). Differences are To minus
+    From, same as the ERP footer."""
+    def num(value):
+        return clean_and_serialize(value, "numeric") or 0
+
+    def account_code_of(account_id, label):
+        if account_codes.get(account_id):
+            return account_codes[account_id]
+        # accountLabel is "<code> - <name>"
+        if label and " - " in label:
+            return label.split(" - ", 1)[0].strip()
+        return None
+
+    adj_id = str(doc["_id"])
+    org_id = to_str_id(doc.get("OrganizationId") or doc.get("organizationId"))
+    branch_id = to_str_id(doc.get("branchId") or doc.get("branch"))
+    if not org_id and branch_id:
+        org_id = branch_to_org.get(branch_id)
+    if not branch_id and org_id:
+        branch_id = org_to_branch.get(org_id)
+    voucher_date = clean_and_serialize(doc.get("voucherDate"))
+
+    totals = {side: {"gross": 0, "pure": 0, "making": 0, "cost": 0} for side in ("from", "to")}
+    items = []
+    adjustment_account = None
+    remarks = []
+
+    for line_idx, line in enumerate(doc.get("items") or [], start=1):
+        line_no = line.get("lineNo") or line_idx
+        adjustment_account = adjustment_account or to_str_id(line.get("adjustmentAccount"))
+        if line.get("remarks"):
+            remarks.append(line["remarks"])
+
+        for side, key, action in (("from", "fromItems", "remove"), ("to", "toItems", "add")):
+            for row_no, it in enumerate(line.get(key) or [], start=1):
+                account_id = to_str_id(it.get("accountId"))
+                gross = num(it.get("grossWeight"))
+                pure = num(it.get("pureWeight"))
+                making = num(it.get("avgMakingAmount"))
+                cost = num(it.get("costTotal"))
+
+                t = totals[side]
+                t["gross"] += gross
+                t["pure"] += pure
+                t["making"] += making
+                t["cost"] += cost
+
+                items.append({
+                    "id": f"{adj_id}:{line_no}:{side}:{row_no}",
+                    "adjustment_id": adj_id,
+                    "organization_id": org_id,
+                    "branch_id": branch_id,
+                    "voucher_number": doc.get("voucherNumber"),
+                    "voucher_date": voucher_date,
+                    "line_no": line_no,
+                    "side": side,
+                    "action": action,
+                    "row_no": row_no,
+                    "stock_id": to_str_id(it.get("stockId")),
+                    "stock_code": it.get("stockCode") or None,
+                    "account_id": account_id,
+                    "account_code": account_code_of(account_id, it.get("accountLabel")) if account_id else None,
+                    "account_label": it.get("accountLabel") or None,
+                    "bar_code": it.get("barCode") or None,
+                    "pieces": clean_and_serialize(it.get("pieces"), "integer") or 0,
+                    "gross_weight_grams": gross,
+                    "purity": num(it.get("purity")),
+                    "pure_weight_grams": pure,
+                    "making_rate": num(it.get("avgMakingRate")),
+                    "making_amount": making,
+                    "cost_rate": num(it.get("costRate")),
+                    "cost_total": cost,
+                    "sync_at": now,
+                })
+
+    entered_by = to_str_id(doc.get("enteredBy"))
+    f, t = totals["from"], totals["to"]
+    header = {
+        "id": adj_id,
+        "organization_id": org_id,
+        "branch_id": branch_id,
+        "voucher_number": doc.get("voucherNumber"),
+        "voucher_type": doc.get("voucherType"),
+        "voucher_date": voucher_date,
+        "division_id": to_str_id(doc.get("division")),
+        "status": doc.get("status"),
+        "is_deleted": bool(doc.get("isDeleted")),
+        "entered_by": entered_by,
+        "entered_by_name": salesman_names.get(entered_by),
+        "adjustment_account_id": adjustment_account,
+        "adjustment_account_code": account_codes.get(adjustment_account),
+        "remarks": "\n".join(remarks) or None,
+        "from_gross_weight_grams": f["gross"],
+        "from_pure_weight_grams": f["pure"],
+        "from_making_amount": f["making"],
+        "from_cost_total": f["cost"],
+        "to_gross_weight_grams": t["gross"],
+        "to_pure_weight_grams": t["pure"],
+        "to_making_amount": t["making"],
+        "to_cost_total": t["cost"],
+        "gross_difference_grams": round(t["gross"] - f["gross"], 6),
+        "pure_difference_grams": round(t["pure"] - f["pure"], 6),
+        "making_difference": round(t["making"] - f["making"], 4),
+        "cost_difference": round(t["cost"] - f["cost"], 4),
+        "cancelled_at": clean_and_serialize(doc.get("cancelledAt")),
+        "created_at": clean_and_serialize(doc.get("createdAt")),
+        "updated_at": clean_and_serialize(doc.get("updatedAt")),
+        "sync_at": now,
+    }
+    return header, items
+
+
+def sync_stock_adjustments_custom(mongo_db, pg_conn, default_cron_query, branch_to_org, org_to_branch):
+    """Mongo stockadjustments -> stock_adjustments + stock_adjustment_items.
+    Skipped where sql/stock_adjustments.sql has not been run (e.g. uat)."""
+    pg_cursor = pg_conn.cursor()
+    try:
+        header_schema = _get_columns_schema(pg_cursor, "stock_adjustments")
+        items_schema = _get_columns_schema(pg_cursor, "stock_adjustment_items")
+        if not header_schema or not items_schema:
+            return
+
+        mongo_query = {} if INITIAL_RUN else default_cron_query
+        docs = list(mongo_db["stockadjustments"].find(mongo_query))
+        if not docs:
+            logger.info("  [stock_adjustments] Synced 0 records.")
+            return
+
+        salesman_ids, account_ids = set(), set()
+        for doc in docs:
+            salesman_ids.add(to_str_id(doc.get("enteredBy")))
+            for line in doc.get("items") or []:
+                account_ids.add(to_str_id(line.get("adjustmentAccount")))
+                for it in (line.get("fromItems") or []) + (line.get("toItems") or []):
+                    account_ids.add(to_str_id(it.get("accountId")))
+        pg_cursor.execute("SELECT id, name FROM salesmen WHERE id = ANY(%s);",
+                          ([i for i in salesman_ids if i],))
+        salesman_names = dict(pg_cursor.fetchall())
+        pg_cursor.execute("SELECT id, account_code FROM accounts WHERE id = ANY(%s);",
+                          ([i for i in account_ids if i],))
+        account_codes = dict(pg_cursor.fetchall())
+
+        now = datetime.now(timezone.utc)
+        headers, items = [], []
+        for doc in docs:
+            header, doc_items = _build_stock_adjustment_rows(
+                doc, branch_to_org, org_to_branch, salesman_names, account_codes, now)
+            headers.append(header)
+            items.extend(doc_items)
+
+        header_cols = [c for c in headers[0] if c in header_schema]
+        _upsert_batch(pg_cursor, "stock_adjustments", header_cols,
+                      [tuple(h.get(c) for c in header_cols) for h in headers])
+
+        # Replace items per voucher so removed/edited rows don't linger
+        pg_cursor.execute("DELETE FROM stock_adjustment_items WHERE adjustment_id = ANY(%s);",
+                          ([h["id"] for h in headers],))
+        if items:
+            item_cols = [c for c in items[0] if c in items_schema]
+            _upsert_batch(pg_cursor, "stock_adjustment_items", item_cols,
+                          [tuple(i.get(c) for c in item_cols) for i in items])
+
+        pg_conn.commit()
+        logger.info(f"  [stock_adjustments] Synced {len(headers)} records, {len(items)} item rows.")
+    except Exception as e:
+        pg_conn.rollback()
+        logger.error(f"  [stock_adjustments] Custom sync FAILED: {e}")
+    finally:
+        pg_cursor.close()
+
+
 def sync_role_permissions(mongo_db, pg_conn):
     pg_cursor = pg_conn.cursor()
     try:
@@ -1939,6 +2160,7 @@ def run_migration(name, mongo_uri, mongo_db_name, pg_host, pg_port, pg_database,
         sync_accounts_custom(mongo_db, pg_conn, default_cron_query)
         sync_company_accounts_custom(mongo_db, pg_conn, default_cron_query)
         sync_organizations_custom(mongo_db, pg_conn, default_cron_query)
+        sync_stock_adjustments_custom(mongo_db, pg_conn, default_cron_query, branch_to_org, org_to_branch)
         sync_metal_transaction_items(mongo_db, pg_conn, default_cron_query, INITIAL_RUN, f"{name}:")
 
         logger.info("-" * 60)
