@@ -115,6 +115,10 @@ FIELD_NAME_OVERRIDES = {
         "tradeLicense": "trade_license_number",
         "tradeLicenseNumber": "trade_license_number"
     },
+    "transaction_fixings": {
+        "hedge": "is_hedge",
+        "type": "fixing_type"
+    },
     "metal_transactions": {
         "party": "party_id",
         "partyId": "party_id",
@@ -415,6 +419,35 @@ NESTED_ARRAY_SYNC_CONFIG = {
             "total_value": "totalValue",
             "metal_amount": "metalAmount",
             "metal_cost_amount": "metalCostAmount"
+        }
+    },
+    "recurring_transaction_entries": {
+        "mongo_collection": "recurringtransactions",
+        "array_path": ["payload", "entries"],
+        "parent_fk_column": "recurring_transaction_id",
+        "conflict_target": "id",
+        "mappings": {
+            "party_id": "partyId",
+            "party_name": "partyName",
+            "entry_type": "entryType",
+            "is_metal": "isMetal",
+            "division_id": "division",
+            "metal_type": "metalType",
+            "cost_center_id": "costCenterId",
+            "quantity": "quantity",
+            "metal_rate_type_id": "metalRateType",
+            "metal_rate_type_label": "metalRateTypeLabel",
+            "metal_rate_value": "metalRateValue",
+            "per_gram_aed_rate": "perGramAedRate",
+            "metal_value": "metalValue",
+            "transaction_currency": "transactionCurrency",
+            "transaction_amount": "transactionAmount",
+            "converted_currency": "convertedCurrency",
+            "converted_amount": "convertedAmount",
+            "remarks": "remarks",
+            "description": "description",
+            "status": "status",
+            "entry_branch_id": "branchId"
         }
     },
     "transaction_fixing_orders": {
@@ -838,6 +871,17 @@ def sync_collection(
                     for col, val in draft_fields.items():
                         if col in pg_columns_schema:
                             row_data[col] = val
+
+            # Party / amount / currency shown on the ERP Recurring Transaction list.
+            if pg_table_name == "recurring_transactions":
+                summary = doc.get("summary") or {}
+                if isinstance(summary, dict):
+                    for pg_col, m_key in (("party_names", "partyNames"),
+                                          ("total_amount", "totalAmount"),
+                                          ("currency_code", "currency")):
+                        if pg_col in pg_columns_schema:
+                            row_data[pg_col] = clean_and_serialize(
+                                summary.get(m_key), pg_columns_schema[pg_col])
 
             # 2. GENERAL FIELD MAPPING LOOP
             for key, value in doc.items():
@@ -1541,6 +1585,7 @@ def sync_metal_transactions(mongo_db, pg_conn, default_cron_query):
                 "organization_id": to_str_id(tx.get("OrganizationId") or tx.get("organizationId") or tx.get("organization_id")),
                 "branch_id": to_str_id(tx.get("branchId") or tx.get("branch_id")),
                 "voucher_number": tx.get("voucherNumber") or tx.get("voucher_number"),
+                "hedge_voucher_number": tx.get("hedgeVoucherNumber"),
                 "voucher_type": tx.get("voucherType") or tx.get("voucher_type"),
                 "transaction_type": tx.get("transactionType") or tx.get("transaction_type"),
                 "voucher_date": clean_and_serialize(tx.get("voucherDate")),
@@ -2037,6 +2082,34 @@ def sync_user_branch_roles(mongo_db, pg_conn):
         pg_cursor.close()
 
 
+def check_own_stock_rows(cursor):
+    """bug-1015: every branch/division with stock must have an
+    ai_own_stock_position row (the AI Deal Strategy reads it). Logs an
+    error per missing row, so the run alert mail reports it."""
+    try:
+        cursor.execute("""
+            SELECT b.organization_id, b.branch_id, MAX(b.division_name),
+                   ROUND(SUM(b.pure_weight), 3)
+            FROM ai_stock_balance b
+            WHERE b.division_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM ai_own_stock_position o
+                  WHERE o.organization_id = b.organization_id
+                    AND o.branch_id = b.branch_id
+                    AND o.division_id = b.division_id)
+            GROUP BY b.organization_id, b.branch_id, b.division_id
+            HAVING ABS(SUM(b.pure_weight)) > 0.001;
+        """)
+        for org_id, branch_id, division, pure in cursor.fetchall():
+            logger.error(
+                f"  [own_stock_check] Missing ai_own_stock_position row: org {org_id}, "
+                f"branch {branch_id}, division {division}, stock pure weight {pure} g"
+            )
+    except Exception:
+        cursor.connection.rollback()
+        logger.exception("  [own_stock_check] FAILED")
+
+
 def refresh_postgres_reports(pg_conn):
     """Shared by the frequent fetch job and daily deletion job. Return success."""
     refresh_functions = [
@@ -2057,12 +2130,19 @@ def refresh_postgres_reports(pg_conn):
             for fn in refresh_functions:
                 try:
                     logger.info("Executing: SELECT %s;", fn)
+                    del pg_conn.notices[:]
                     cursor.execute(f"SELECT {fn};")
                     pg_conn.commit()
+                    # RAISE WARNING inside a refresh (e.g. skipped rows) -> error
+                    # log, so the run alert mail picks it up.
+                    for notice in pg_conn.notices:
+                        if notice.startswith("WARNING"):
+                            logger.error("%s: %s", fn, notice.strip())
                 except Exception:
                     pg_conn.rollback()
                     failed = True
                     logger.exception("Failed to execute %s", fn)
+            check_own_stock_rows(cursor)
     except Exception:
         pg_conn.rollback()
         failed = True
