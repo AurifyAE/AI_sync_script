@@ -215,6 +215,14 @@ FIELD_NAME_OVERRIDES = {
         "source": "source_id",
         "sourceId": "source_id",
     },
+    "taxes": {
+        "type": "tax_type",
+    },
+    "pdc_schedules": {
+        "party": "party_id",
+        "currency": "currency_id",
+        "pdcAccount": "pdc_account_id",
+    },
 }
 
 
@@ -375,11 +383,37 @@ NESTED_ARRAY_SYNC_CONFIG = {
         "array_path": ["items"],
         "parent_fk_column": "income_expense_id",
         "conflict_target": "id",
+        # Items can be removed when a voucher is edited; drop their old rows.
+        "replace_children": True,
         "mappings": {
+            "item_id": "_id",
             "account_id": "accountId",
-            "amount": "totalAmount",
+            "description": "description",
+            "amount": "amount",
             "vat_percentage": "vatPercentage",
-            "vat_amount": "vatAmount"
+            "vat_amount": "vatAmount",
+            "total_amount": "totalAmount"
+        }
+    },
+    "tax_items": {
+        "mongo_collection": "taxes",
+        "array_path": ["items"],
+        "parent_fk_column": "tax_id",
+        "conflict_target": "id",
+        # Items can be removed when a voucher is edited; drop their old rows.
+        "replace_children": True,
+        "mappings": {
+            "item_id": "_id",
+            "account_id": "accountId",
+            "remarks": "remarks",
+            "amount": "amount",
+            "vat_id": "vatId",
+            "vat_percentage": "vatPercentage",
+            "vat_amount": "vatAmount",
+            "total_amount": "totalAmount",
+            "tax_number": "taxNumber",
+            "invoice_number": "invoiceNumber",
+            "tax_invoice_date": "taxInvoiceDate"
         }
     },
     "opening_balance_entries": {
@@ -474,6 +508,10 @@ def sync_all_nested_arrays_generic(mongo_db, pg_conn, default_cron_query):
         try:
             logger.info(f"   [{pg_table}] Dynamic nested sync starting...")
             schema = _get_columns_schema(pg_cursor, pg_table)
+            if not schema:
+                # Table not created in this environment yet (its sql/ file not run).
+                logger.info(f"   [{pg_table}] Table not found, skipped.")
+                continue
             id_is_int = schema.get("id") in ['integer', 'bigint']
             fk_type = schema.get(config["parent_fk_column"])
             fk_is_int = fk_type in ['integer', 'bigint']
@@ -503,7 +541,14 @@ def sync_all_nested_arrays_generic(mongo_db, pg_conn, default_cron_query):
                 nested_array = doc
                 for path_key in array_path:
                     nested_array = nested_array.get(path_key, []) if isinstance(nested_array, dict) else []
-                
+
+                if config.get("replace_children") and not id_is_int:
+                    keep_ids = [f"{parent_id}_{idx}" for idx in range(len(nested_array) if isinstance(nested_array, list) else 0)]
+                    pg_cursor.execute(
+                        f'DELETE FROM "{pg_table}" WHERE "{fk_column}" = %s AND NOT (id = ANY(%s));',
+                        (parent_id, keep_ids)
+                    )
+
                 if not nested_array or not isinstance(nested_array, list):
                     continue
                 
@@ -883,6 +928,33 @@ def sync_collection(
                             row_data[pg_col] = clean_and_serialize(
                                 summary.get(m_key), pg_columns_schema[pg_col])
 
+            # Cash/Bank account and settlement details on the ERP Expense / Income Entry.
+            if pg_table_name == "income_expenses":
+                cash_bank = doc.get("cashBank") if isinstance(doc.get("cashBank"), dict) else {}
+                settlement = doc.get("settlement") if isinstance(doc.get("settlement"), dict) else {}
+                ie_fields = {
+                    "cash_bank_account_id": to_str_id(cash_bank.get("accountId")),
+                    "cash_bank_amount": cash_bank.get("amount"),
+                    "cash_type": settlement.get("cashType"),
+                    "settlement_account_id": to_str_id(settlement.get("accountId")),
+                    "settlement_amount": settlement.get("amount"),
+                    "bank_account_id": to_str_id(settlement.get("bankAccountId")),
+                    "cheque_no": settlement.get("chequeNo"),
+                    "cheque_date": settlement.get("chequeDate"),
+                    "bank_name": settlement.get("bankName"),
+                    "transfer_reference": settlement.get("transferReference"),
+                    "card_charge_percent": settlement.get("cardChargePercent"),
+                    "card_charge_amount": settlement.get("cardChargeAmount"),
+                    "fx_rate": settlement.get("fxRate"),
+                    "fx_gain": settlement.get("fxGain"),
+                    "fx_loss": settlement.get("fxLoss"),
+                    "is_pdc": bool(settlement.get("isPDC")),
+                    "pdc_status": settlement.get("pdcStatus"),
+                }
+                for col, val in ie_fields.items():
+                    if col in pg_columns_schema:
+                        row_data[col] = clean_and_serialize(val, pg_columns_schema[col])
+
             # 2. GENERAL FIELD MAPPING LOOP
             for key, value in doc.items():
                 if key == "_id":
@@ -939,6 +1011,22 @@ def sync_collection(
                     row_data["organization_id"], row_data["branch_id"], row_data["division_id"] = parent
 
             all_docs.append(row_data)
+
+        # pdcschedules has no org/branch; take them from the parent entry.
+        if pg_table_name == "pdc_schedules" and all_docs:
+            entry_ids = [ObjectId(r["entry_id"]) for r in all_docs if ObjectId.is_valid(r.get("entry_id") or "")]
+            entry_map = {
+                str(e["_id"]): e for e in mongo_db["entries"].find(
+                    {"_id": {"$in": entry_ids}},
+                    {"organizationId": 1, "branchId": 1, "branch": 1}
+                )
+            }
+            for row_data in all_docs:
+                entry = entry_map.get(row_data.get("entry_id")) or {}
+                row_data["branch_id"] = to_str_id(entry.get("branchId") or entry.get("branch"))
+                row_data["organization_id"] = to_str_id(entry.get("organizationId")) or branch_to_org.get(row_data["branch_id"])
+                if not row_data["branch_id"]:
+                    logger.warning(f"  [pdc_schedules] {row_data['id']}: parent entry {row_data.get('entry_id')} not found, branch left NULL")
 
         if not all_docs:
             logger.info(f"  [{pg_table_name}] No new/updated records in this window.")
@@ -1268,6 +1356,7 @@ def sync_stock_buffers_custom(mongo_db, pg_conn, default_cron_query):
             row_data = {
                 "id": str(doc.get("_id")),
                 "organization_id": org_id,
+                "created_by": created_by,
                 "buffer_goal_gms": clean_and_serialize(doc.get("bufferGoal"), 'numeric'),
                 "balance_when_set_gms": clean_and_serialize(doc.get("balanceWhenSet"), 'numeric'),
                 "buffer_date": clean_and_serialize(doc.get("date")),
