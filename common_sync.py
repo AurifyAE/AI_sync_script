@@ -171,7 +171,8 @@ FIELD_NAME_OVERRIDES = {
         "divisionId": "division_id",
         "organizationId": "organization_id",
         "OrganizationId": "organization_id",
-        "branchId": "branch_id"
+        "branchId": "branch_id",
+        "timestamp": "log_timestamp"
     },
     "metal_stocks": {
         "brand": "brand_id",
@@ -186,6 +187,8 @@ FIELD_NAME_OVERRIDES = {
         "countryId": "country_id",
         "karat": "karat_id",
         "karatId": "karat_id",
+        # Commodity (division) of the stock; Own Stock scopes inventory by it.
+        "metalType": "metal_type_id",
     },
     "transactions": {
         "branch": "branch_id",
@@ -231,7 +234,7 @@ def to_snake_case(name: str) -> str:
     return s.lower().lstrip('_')
 
 
-def clean_and_serialize(value, expected_type=None):
+def clean_and_serialize(value, expected_type=None, max_abs=1e12):
     if value is None:
         return None
     if isinstance(value, ObjectId):
@@ -253,7 +256,8 @@ def clean_and_serialize(value, expected_type=None):
             if isinstance(value, str):
                 value = re.sub(r'[^0-9.-]', '', value)
             val_float = float(value)
-            if abs(val_float) >= 1e12:
+            if abs(val_float) >= max_abs:
+                logger.warning(f"Numeric value {val_float} exceeds column limit {max_abs:g}; stored as NULL")
                 return None
             return val_float if expected_type in ['numeric', 'double precision', 'real'] else int(val_float)
         except (ValueError, TypeError):
@@ -337,6 +341,26 @@ def _get_columns_schema(pg_cursor, table_name):
         WHERE table_name = %s AND table_schema = 'public'
     """, (table_name,))
     return {row[0]: row[1] for row in pg_cursor.fetchall()}
+
+
+def _get_numeric_limits(pg_cursor, table_name):
+    """Largest absolute value each numeric(p,s) column can hold (10 ** (p - s))."""
+    pg_cursor.execute("""
+        SELECT column_name, numeric_precision, numeric_scale FROM information_schema.columns
+        WHERE table_name = %s AND table_schema = 'public'
+          AND data_type = 'numeric' AND numeric_precision IS NOT NULL
+    """, (table_name,))
+    return {row[0]: 10 ** (row[1] - (row[2] or 0)) for row in pg_cursor.fetchall()}
+
+
+def changed_since_query(since: datetime) -> dict:
+    """Docs updated since `since`, or inserted since then (ObjectId time).
+    The _id branch catches docs with no updatedAt (log collections) and
+    docs inserted with a backdated updatedAt (seeded/imported data)."""
+    return {"$or": [
+        {"updatedAt": {"$gte": since}},
+        {"_id": {"$gte": ObjectId.from_datetime(since)}},
+    ]}
 
 
 def _upsert_batch(pg_cursor, table_name, columns_list, rows):
@@ -800,6 +824,7 @@ def sync_collection(
 
         id_is_int = pg_columns_schema.get("id") in ['integer', 'bigint']
         overrides = FIELD_NAME_OVERRIDES.get(pg_table_name, {})
+        numeric_limits = _get_numeric_limits(pg_cursor, pg_table_name)
 
         if INITIAL_RUN:
             mongo_query = {}
@@ -815,7 +840,7 @@ def sync_collection(
 
             if last_sync:
                 safe_last_sync = last_sync - timedelta(minutes=5)
-                mongo_query = {"updatedAt": {"$gte": safe_last_sync}}
+                mongo_query = changed_since_query(safe_last_sync)
             else:
                 mongo_query = default_cron_query
 
@@ -969,7 +994,8 @@ def sync_collection(
                     and value is not None
                 )
                 if col in pg_columns_schema and (col not in row_data or replace_null_alias):
-                    row_data[col] = clean_and_serialize(value, pg_columns_schema[col])
+                    row_data[col] = clean_and_serialize(
+                        value, pg_columns_schema[col], numeric_limits.get(col, 1e12))
 
             # 3. ORGANIZATIONS, BRANCH, DIVISION LOGICS
             if pg_table_name == "organizations" and not row_data.get("name"):
@@ -1036,7 +1062,11 @@ def sync_collection(
         columns_str = ", ".join([f'"{c}"' for c in columns_list])
         
         if not id_is_int:
-            update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in columns_list if c not in ("id", "created_at", "sync_at")])
+            update_cols = [f'"{c}" = EXCLUDED."{c}"' for c in columns_list if c not in ("id", "created_at", "sync_at")]
+            # Keep an existing created_at, but fill it on rows that were inserted without one.
+            if "created_at" in columns_list:
+                update_cols.append(f'"created_at" = COALESCE("{pg_table_name}"."created_at", EXCLUDED."created_at")')
+            update_str = ", ".join(update_cols)
             sql = f'INSERT INTO "{pg_table_name}" ({columns_str}) VALUES %s ON CONFLICT (id) DO UPDATE SET {update_str};'
         else:
             sql = f'INSERT INTO "{pg_table_name}" ({columns_str}) VALUES %s;'
@@ -1128,15 +1158,21 @@ def sync_divisions_custom(mongo_db, pg_conn, default_cron_query):
     try:
         mongo_query = {} if INITIAL_RUN else default_cron_query
         mongo_cursor = mongo_db["divisionmasters"].find(mongo_query)
+        branch_to_org, _ = build_relationship_maps(pg_conn)
         all_rows = []
 
         for doc in mongo_cursor:
+            branch_id = to_str_id(doc.get("branchId"))
             row_data = {
                 "id": str(doc.get("_id")),
                 "code": doc.get("code"),
                 "description": doc.get("description"),
-                "organization_id": to_str_id(doc.get("OrganizationId")),
-                "branch_id": to_str_id(doc.get("branchId")),
+                # divisionmasters carry no org id; take it from the division's branch.
+                "organization_id": (
+                    to_str_id(doc.get("OrganizationId") or doc.get("organizationId"))
+                    or branch_to_org.get(branch_id)
+                ),
+                "branch_id": branch_id,
                 "is_active": doc.get("isActive", True),
                 "account_id": to_str_id(doc.get("accountId")),
                 "purchase_expense_account_id": to_str_id(doc.get("purchaseExpenseAccountId")),
@@ -1593,6 +1629,7 @@ def sync_metal_transactions(mongo_db, pg_conn, default_cron_query):
         pg_columns_schema = _get_columns_schema(pg_cursor, "metal_transactions")
         if not pg_columns_schema:
             return
+        numeric_limits = _get_numeric_limits(pg_cursor, "metal_transactions")
 
         # 1. Division Lookup
         pg_cursor.execute("SELECT id, description FROM divisions WHERE id IS NOT NULL;")
@@ -1687,6 +1724,9 @@ def sync_metal_transactions(mongo_db, pg_conn, default_cron_query):
                 "is_hedge": bool(is_hedge),
                 "is_unfix": bool(tx.get("unfix") or tx.get("isUnfix")),
                 "is_deleted": bool(is_deleted),
+                # POS voucher kind (sale / exchangeReceipt); Own Stock pure weight.
+                "is_pos": tx.get("isPOS") is True,
+                "pos_type": tx.get("posType"),
                 
                 # Foreign Keys
                 "party_id": to_str_id(tx.get("partyCode") or tx.get("party_id")),
@@ -1698,11 +1738,11 @@ def sync_metal_transactions(mongo_db, pg_conn, default_cron_query):
                 # Financials
                 "currency_rate": clean_and_serialize(currency_rate_val, 'numeric'),
                 "metal_rate": clean_and_serialize(metal_rate_val, 'numeric'),
-                "item_sub_total": clean_and_serialize(sub_total_val, 'numeric'),
-                "item_total_vat": clean_and_serialize(vat_val, 'numeric'),
-                "net_amount": clean_and_serialize(net_amount_val, 'numeric'),
-                "total_amount": clean_and_serialize(total_amount_val, 'numeric'),
-                "item_total_amount": clean_and_serialize(total_amount_val, 'numeric'),
+                "item_sub_total": clean_and_serialize(sub_total_val, 'numeric', numeric_limits.get("item_sub_total", 1e12)),
+                "item_total_vat": clean_and_serialize(vat_val, 'numeric', numeric_limits.get("item_total_vat", 1e12)),
+                "net_amount": clean_and_serialize(net_amount_val, 'numeric', numeric_limits.get("net_amount", 1e12)),
+                "total_amount": clean_and_serialize(total_amount_val, 'numeric', numeric_limits.get("total_amount", 1e12)),
+                "item_total_amount": clean_and_serialize(total_amount_val, 'numeric', numeric_limits.get("item_total_amount", float("inf"))),
                 
                 # Stock Item Summary
                 "gross_weight": clean_and_serialize(first_item.get("grossWeight"), 'numeric'),
@@ -1829,6 +1869,7 @@ def sync_metal_transaction_items(mongo_db, pg_conn, default_cron_query, initial_
                     "division_code": tx.get("divisionCode"),
                     "division_name": tx.get("divisionName"),
                     "stock_code": to_str_id(item.get("stockCode") or item.get("stock_code")),
+                    "pos_stock_item_id": to_str_id(item.get("posStockItemId")),
                     "stock_description": item.get("description"),
                     "gross_weight": numeric_value(item.get("grossWeight")),
                     "pure_weight": numeric_value(item.get("pureWeight")),
@@ -2277,7 +2318,7 @@ def run_migration(name, mongo_uri, mongo_db_name, pg_host, pg_port, pg_database,
     try:
         time_filter = sync_monitor.get_sync_time_filter(name, run_started, window_minutes)
         logger.info(f"Fetching Mongo changes since {time_filter.isoformat()}")
-        default_cron_query = {"updatedAt": {"$gte": time_filter}}
+        default_cron_query = changed_since_query(time_filter)
 
         mongo_client = MongoClient(
             mongo_uri, datetime_conversion='DATETIME_AUTO',

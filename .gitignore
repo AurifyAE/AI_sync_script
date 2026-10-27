@@ -66,3 +66,5 @@ pipeline_v2/
 
 # Sync state (last successful run per pipeline)
 .sync_state/
+/files/
+
