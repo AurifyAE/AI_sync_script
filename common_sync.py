@@ -374,11 +374,33 @@ NESTED_ARRAY_SYNC_CONFIG = {
         "mongo_collection": "accounts",
         "array_path": ["balances", "cashBalance"],
         "parent_fk_column": "account_id",
-        "conflict_target": "account_id, currency_code",
+        # cashBalance[].code can be wrong in Mongo; key by the currency id and
+        # take the code from currency_masters (the ERP resolves it the same way).
+        "conflict_target": "account_id, currency_id",
+        "currency_code_from_master": True,
         "mappings": {
             "currency_code": "code",
             "amount": "amount",
-            "party_id": "_id"
+            "party_id": "_id",
+            "currency_id": "currency",
+            "ledger_net_in_base": "ledgerNetInBase",
+            "is_default": "isDefault"
+        }
+    },
+    # Party currency definitions: USD -> base rate and cash FX on the margin reports.
+    "account_currency_definitions": {
+        "mongo_collection": "accounts",
+        "array_path": ["acDefinition", "currencies"],
+        "parent_fk_column": "account_id",
+        "conflict_target": "id",
+        # Currencies can be removed from a party; drop their old rows.
+        "replace_children": True,
+        "mappings": {
+            "currency_id": "currency",
+            "is_default": "isDefault",
+            "convert_rate": "convertRate",
+            "purchase_price": "purchasePrice",
+            "sell_price": "sellPrice"
         }
     },
     "account_metal_balances": {
@@ -548,7 +570,12 @@ def sync_all_nested_arrays_generic(mongo_db, pg_conn, default_cron_query):
 
             if id_is_int and conflict_target == "id" and "source_key" in schema:
                 conflict_target = "source_key"
-            
+
+            currency_codes = {}
+            if config.get("currency_code_from_master"):
+                pg_cursor.execute("SELECT id, currency_code FROM currency_masters WHERE id IS NOT NULL;")
+                currency_codes = {str(r[0]): r[1] for r in pg_cursor.fetchall() if r[1]}
+
             mongo_query = {} if INITIAL_RUN else default_cron_query
             mongo_cursor = mongo_db[mongo_coll].find(mongo_query)
             
@@ -595,7 +622,10 @@ def sync_all_nested_arrays_generic(mongo_db, pg_conn, default_cron_query):
                         if pg_col in schema:
                             val = item.get(mongo_field)
                             row_data[pg_col] = clean_and_serialize(val, schema[pg_col])
-                    
+
+                    if currency_codes.get(row_data.get("currency_id")):
+                        row_data["currency_code"] = currency_codes[row_data["currency_id"]]
+
                     try:
                         unique_key = "-".join([str(row_data.get(c)) for c in conflict_cols])
                     except Exception:
@@ -1476,6 +1506,12 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
             acc_type_raw = doc.get("accountType") or doc.get("account_type")
             acc_type_val = to_str_id(acc_type_raw) if acc_type_raw else None
 
+            # 5. Margin report inputs (only the first limitsMargins entry is read by the ERP)
+            limits = doc.get("limitsMargins") or []
+            first_limit = limits[0] if isinstance(limits, list) and limits and isinstance(limits[0], dict) else {}
+            balances = doc.get("balances") or {}
+            if not isinstance(balances, dict): balances = {}
+
             raw_row = {
                 "id": str(doc.get("_id")),
                 "organization_id": to_str_id(doc.get("OrganizationId") or doc.get("organizationId")),
@@ -1503,6 +1539,9 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
                 "status": doc.get("status"),
                 "is_active": doc.get("isActive", True),
                 "is_deleted": doc.get("isDeleted", False),
+                "margin_pct": first_limit.get("Margin"),
+                "total_outstanding": balances.get("totalOutstanding"),
+                "favorite": bool(doc.get("favorite")),
                 "sync_at": datetime.now(timezone.utc)
             }
 
