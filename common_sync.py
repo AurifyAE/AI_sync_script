@@ -226,6 +226,28 @@ FIELD_NAME_OVERRIDES = {
         "currency": "currency_id",
         "pdcAccount": "pdc_account_id",
     },
+    "cheque_registers": {
+        "party": "party_id",
+        "currency": "currency_id",
+        "chequeBank": "cheque_bank_id",
+        "pdcReceiptAccount": "pdc_receipt_account_id",
+        "pdcIssueAccount": "pdc_issue_account_id",
+        # to_snake_case would give is_p_d_c
+        "isPDC": "is_pdc",
+    },
+}
+
+# PDC lifecycle fields kept only on the cheque line (entries.cash[cashItemIndex]),
+# not on the chequeregisters doc. Copied as stored onto cheque_registers.
+CHEQUE_LINE_FIELDS = {
+    "pdc_voucher_number": "pdcVoucherNumber",
+    "pdc_voucher_type": "pdcVoucherType",
+    "pdc_reference_voucher": "pdcReferenceVoucher",
+    "pdc_voucher_action": "pdcVoucherAction",
+    "returned_date": "returnedDate",
+    "bounced_date": "bouncedDate",
+    "bounce_remarks": "bounceRemarks",
+    "hold_date": "holdDate",
 }
 
 
@@ -528,6 +550,23 @@ NESTED_ARRAY_SYNC_CONFIG = {
             "description": "description",
             "status": "status",
             "entry_branch_id": "branchId"
+        }
+    },
+    # Cheque lifecycle steps (PDC Clearance history).
+    "cheque_register_history": {
+        "mongo_collection": "chequeregisters",
+        "array_path": ["statusHistory"],
+        "parent_fk_column": "cheque_register_id",
+        "conflict_target": "id",
+        "replace_children": True,
+        "mappings": {
+            "history_id": "_id",
+            "status": "status",
+            "action": "action",
+            "snapshot": "snapshot",
+            "remarks": "remarks",
+            "performed_at": "performedAt",
+            "performed_by": "performedBy"
         }
     },
     "transaction_fixing_orders": {
@@ -841,6 +880,54 @@ def sync_organizations_custom(mongo_db, pg_conn, default_cron_query):
         pg_cursor.close()
 
 
+def _add_cheque_line_fields(mongo_db, rows, pg_columns_schema):
+    """Copy the PDC voucher stamp and return/bounce/hold dates from the cheque
+    line (entries.cash[cash_item_index]) onto cheque_registers rows."""
+    entry_ids = [ObjectId(r["entry_id"]) for r in rows if ObjectId.is_valid(r.get("entry_id") or "")]
+    projection = {f"cash.{f}": 1 for f in CHEQUE_LINE_FIELDS.values()}
+    projection["cash.pdcStatus"] = 1
+    entry_cash = {
+        str(e["_id"]): e.get("cash") or []
+        for e in mongo_db["entries"].find({"_id": {"$in": entry_ids}}, projection)
+    }
+    for row_data in rows:
+        cash = entry_cash.get(row_data.get("entry_id"))
+        idx = row_data.get("cash_item_index")
+        line = cash[idx] if cash and isinstance(idx, int) and 0 <= idx < len(cash) else None
+        line = line if isinstance(line, dict) else {}
+        for pg_col, m_key in CHEQUE_LINE_FIELDS.items():
+            if pg_col in pg_columns_schema:
+                row_data[pg_col] = clean_and_serialize(line.get(m_key), pg_columns_schema[pg_col])
+        # Voucher deleted, line removed, or no longer a PDC line: not on the PDC Clearance list.
+        if "is_active" in pg_columns_schema:
+            row_data["is_active"] = bool(line.get("pdcStatus"))
+
+
+def deactivate_deleted_cheque_registers(mongo_db, pg_conn):
+    """The ERP leaves the chequeregisters doc untouched when its voucher is
+    deleted, so the changed-since sync never revisits it. Flag those rows."""
+    pg_cursor = pg_conn.cursor()
+    try:
+        if "is_active" not in _get_columns_schema(pg_cursor, "cheque_registers"):
+            return
+        pg_cursor.execute("SELECT DISTINCT entry_id FROM cheque_registers WHERE is_active AND entry_id IS NOT NULL;")
+        entry_ids = [r[0] for r in pg_cursor.fetchall() if ObjectId.is_valid(r[0])]
+        missing = []
+        for i in range(0, len(entry_ids), BATCH_SIZE):
+            chunk = [ObjectId(x) for x in entry_ids[i:i + BATCH_SIZE]]
+            found = {str(e["_id"]) for e in mongo_db["entries"].find({"_id": {"$in": chunk}}, {"_id": 1})}
+            missing.extend(str(x) for x in chunk if str(x) not in found)
+        if missing:
+            pg_cursor.execute("UPDATE cheque_registers SET is_active = false WHERE entry_id = ANY(%s);", (missing,))
+        pg_conn.commit()
+        logger.info(f"   [cheque_registers] {len(missing)} voucher(s) deleted in Mongo, rows set inactive.")
+    except Exception as e:
+        pg_conn.rollback()
+        logger.error(f"   [cheque_registers] Deleted-voucher check FAILED: {e}")
+    finally:
+        pg_cursor.close()
+
+
 def sync_collection(
     mongo_db, pg_conn, pg_table_name: str, mongo_collection_name: str, default_cron_query: dict,
     branch_to_org: dict, org_to_branch: dict, branch_to_div: dict = None,
@@ -1083,6 +1170,9 @@ def sync_collection(
                 row_data["organization_id"] = to_str_id(entry.get("organizationId")) or branch_to_org.get(row_data["branch_id"])
                 if not row_data["branch_id"]:
                     logger.warning(f"  [pdc_schedules] {row_data['id']}: parent entry {row_data.get('entry_id')} not found, branch left NULL")
+
+        if pg_table_name == "cheque_registers" and all_docs:
+            _add_cheque_line_fields(mongo_db, all_docs, pg_columns_schema)
 
         if not all_docs:
             logger.info(f"  [{pg_table_name}] No new/updated records in this window.")
@@ -2398,6 +2488,7 @@ def run_migration(name, mongo_uri, mongo_db_name, pg_host, pg_port, pg_database,
         logger.info("-" * 60)
         logger.info("Running nested-array sync fixes...")
         sync_all_nested_arrays_generic(mongo_db, pg_conn, default_cron_query)
+        deactivate_deleted_cheque_registers(mongo_db, pg_conn)
         sync_opportunity_stage_history(mongo_db, pg_conn, default_cron_query)
         sync_metal_transactions(mongo_db, pg_conn, default_cron_query)
         sync_role_permissions(mongo_db, pg_conn)
