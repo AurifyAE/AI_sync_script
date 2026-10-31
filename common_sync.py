@@ -385,6 +385,16 @@ def changed_since_query(since: datetime) -> dict:
     ]}
 
 
+def with_balance_updates(query: dict) -> dict:
+    """accounts only: the posting engine can change balances without touching
+    updatedAt, so also take docs whose balances.lastBalanceUpdate moved."""
+    clauses = query.get("$or") if isinstance(query, dict) else None
+    since = next((c["updatedAt"]["$gte"] for c in clauses or [] if "updatedAt" in c), None)
+    if since is None:
+        return query
+    return {"$or": clauses + [{"balances.lastBalanceUpdate": {"$gte": since}}]}
+
+
 def _upsert_batch(pg_cursor, table_name, columns_list, rows):
     columns_str = ", ".join([f'"{c}"' for c in columns_list])
     update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in columns_list if c not in ("id", "created_at", "sync_at")])
@@ -396,10 +406,12 @@ NESTED_ARRAY_SYNC_CONFIG = {
         "mongo_collection": "accounts",
         "array_path": ["balances", "cashBalance"],
         "parent_fk_column": "account_id",
-        # cashBalance[].code can be wrong in Mongo; key by the currency id and
-        # take the code from currency_masters (the ERP resolves it the same way).
-        "conflict_target": "account_id, currency_id",
+        # One row per cashBalance[] entry (source_key = its _id): the code can be
+        # wrong and the same currency id can repeat in Mongo. The code is taken
+        # from currency_masters (the ERP resolves it the same way).
+        "conflict_target": "source_key",
         "currency_code_from_master": True,
+        "include_balance_updates": True,
         "mappings": {
             "currency_code": "code",
             "amount": "amount",
@@ -430,6 +442,7 @@ NESTED_ARRAY_SYNC_CONFIG = {
         "array_path": ["balances", "preciousMetalBalance"],
         "parent_fk_column": "account_id",
         "conflict_target": "account_id, division_id",
+        "include_balance_updates": True,
         "mappings": {
             "division_id": "division", 
             "total_grams": "totalGrams"
@@ -616,8 +629,10 @@ def sync_all_nested_arrays_generic(mongo_db, pg_conn, default_cron_query):
                 currency_codes = {str(r[0]): r[1] for r in pg_cursor.fetchall() if r[1]}
 
             mongo_query = {} if INITIAL_RUN else default_cron_query
+            if config.get("include_balance_updates"):
+                mongo_query = with_balance_updates(mongo_query)
             mongo_cursor = mongo_db[mongo_coll].find(mongo_query)
-            
+
             batch_rows = []
             total_synced = 0
             
@@ -1545,7 +1560,7 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
         if not pg_columns_schema:
             return
 
-        mongo_query = {} if INITIAL_RUN else default_cron_query
+        mongo_query = {} if INITIAL_RUN else with_balance_updates(default_cron_query)
         mongo_cursor = mongo_db["accounts"].find(mongo_query)
         all_rows = []
 
