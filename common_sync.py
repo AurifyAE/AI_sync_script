@@ -2109,12 +2109,19 @@ def sync_metal_transaction_items(mongo_db, pg_conn, default_cron_query, initial_
         pg_cursor.close()
 
 
-def _build_stock_adjustment_rows(doc, branch_to_org, org_to_branch, salesman_names, account_codes, now):
+def _build_stock_adjustment_rows(doc, branch_to_org, org_to_branch, salesman_names, account_codes, now,
+                                 header_limits, item_limits):
     """One header row + one row per fromItems/toItems entry (account-only rows
-    included; they never get an inventory_logs entry). Differences are To minus
-    From, same as the ERP footer."""
+    included; they never get an inventory_logs entry). Header totals come from
+    the line's stored from/to summary, which is what the ERP footer shows and can
+    differ from the sum of the rows; rows are summed only when a summary is
+    missing. Differences are To minus From, same as the ERP footer. A value too
+    big for its column is stored as NULL, never as a false 0."""
     def num(value):
-        return clean_and_serialize(value, "numeric") or 0
+        return clean_and_serialize(value, "numeric", float("inf")) or 0
+
+    def fit(limits, column, value):
+        return clean_and_serialize(value, "numeric", limits.get(column, 1e12))
 
     def account_code_of(account_id, label):
         if account_codes.get(account_id):
@@ -2145,18 +2152,17 @@ def _build_stock_adjustment_rows(doc, branch_to_org, org_to_branch, salesman_nam
             remarks.append(line["remarks"])
 
         for side, key, action in (("from", "fromItems", "remove"), ("to", "toItems", "add")):
-            for row_no, it in enumerate(line.get(key) or [], start=1):
-                account_id = to_str_id(it.get("accountId"))
-                gross = num(it.get("grossWeight"))
-                pure = num(it.get("pureWeight"))
-                making = num(it.get("avgMakingAmount"))
-                cost = num(it.get("costTotal"))
-
+            rows = line.get(key) or []
+            summary = line.get(side)
+            for source in ([summary] if isinstance(summary, dict) else rows):
                 t = totals[side]
-                t["gross"] += gross
-                t["pure"] += pure
-                t["making"] += making
-                t["cost"] += cost
+                t["gross"] += num(source.get("grossWeight"))
+                t["pure"] += num(source.get("pureWeight"))
+                t["making"] += num(source.get("avgMakingAmount"))
+                t["cost"] += num(source.get("costTotal"))
+
+            for row_no, it in enumerate(rows, start=1):
+                account_id = to_str_id(it.get("accountId"))
 
                 items.append({
                     "id": f"{adj_id}:{line_no}:{side}:{row_no}",
@@ -2176,13 +2182,13 @@ def _build_stock_adjustment_rows(doc, branch_to_org, org_to_branch, salesman_nam
                     "account_label": it.get("accountLabel") or None,
                     "bar_code": it.get("barCode") or None,
                     "pieces": clean_and_serialize(it.get("pieces"), "integer") or 0,
-                    "gross_weight_grams": gross,
-                    "purity": num(it.get("purity")),
-                    "pure_weight_grams": pure,
-                    "making_rate": num(it.get("avgMakingRate")),
-                    "making_amount": making,
-                    "cost_rate": num(it.get("costRate")),
-                    "cost_total": cost,
+                    "gross_weight_grams": fit(item_limits, "gross_weight_grams", num(it.get("grossWeight"))),
+                    "purity": fit(item_limits, "purity", num(it.get("purity"))),
+                    "pure_weight_grams": fit(item_limits, "pure_weight_grams", num(it.get("pureWeight"))),
+                    "making_rate": fit(item_limits, "making_rate", num(it.get("avgMakingRate"))),
+                    "making_amount": fit(item_limits, "making_amount", num(it.get("avgMakingAmount"))),
+                    "cost_rate": fit(item_limits, "cost_rate", num(it.get("costRate"))),
+                    "cost_total": fit(item_limits, "cost_total", num(it.get("costTotal"))),
                     "sync_at": now,
                 })
 
@@ -2203,18 +2209,18 @@ def _build_stock_adjustment_rows(doc, branch_to_org, org_to_branch, salesman_nam
         "adjustment_account_id": adjustment_account,
         "adjustment_account_code": account_codes.get(adjustment_account),
         "remarks": "\n".join(remarks) or None,
-        "from_gross_weight_grams": f["gross"],
-        "from_pure_weight_grams": f["pure"],
-        "from_making_amount": f["making"],
-        "from_cost_total": f["cost"],
-        "to_gross_weight_grams": t["gross"],
-        "to_pure_weight_grams": t["pure"],
-        "to_making_amount": t["making"],
-        "to_cost_total": t["cost"],
-        "gross_difference_grams": round(t["gross"] - f["gross"], 6),
-        "pure_difference_grams": round(t["pure"] - f["pure"], 6),
-        "making_difference": round(t["making"] - f["making"], 4),
-        "cost_difference": round(t["cost"] - f["cost"], 4),
+        "from_gross_weight_grams": fit(header_limits, "from_gross_weight_grams", f["gross"]),
+        "from_pure_weight_grams": fit(header_limits, "from_pure_weight_grams", f["pure"]),
+        "from_making_amount": fit(header_limits, "from_making_amount", f["making"]),
+        "from_cost_total": fit(header_limits, "from_cost_total", f["cost"]),
+        "to_gross_weight_grams": fit(header_limits, "to_gross_weight_grams", t["gross"]),
+        "to_pure_weight_grams": fit(header_limits, "to_pure_weight_grams", t["pure"]),
+        "to_making_amount": fit(header_limits, "to_making_amount", t["making"]),
+        "to_cost_total": fit(header_limits, "to_cost_total", t["cost"]),
+        "gross_difference_grams": fit(header_limits, "gross_difference_grams", round(t["gross"] - f["gross"], 6)),
+        "pure_difference_grams": fit(header_limits, "pure_difference_grams", round(t["pure"] - f["pure"], 6)),
+        "making_difference": fit(header_limits, "making_difference", round(t["making"] - f["making"], 4)),
+        "cost_difference": fit(header_limits, "cost_difference", round(t["cost"] - f["cost"], 4)),
         "cancelled_at": clean_and_serialize(doc.get("cancelledAt")),
         "created_at": clean_and_serialize(doc.get("createdAt")),
         "updated_at": clean_and_serialize(doc.get("updatedAt")),
@@ -2232,6 +2238,8 @@ def sync_stock_adjustments_custom(mongo_db, pg_conn, default_cron_query, branch_
         items_schema = _get_columns_schema(pg_cursor, "stock_adjustment_items")
         if not header_schema or not items_schema:
             return
+        header_limits = _get_numeric_limits(pg_cursor, "stock_adjustments")
+        item_limits = _get_numeric_limits(pg_cursor, "stock_adjustment_items")
 
         mongo_query = {} if INITIAL_RUN else default_cron_query
         docs = list(mongo_db["stockadjustments"].find(mongo_query))
@@ -2257,7 +2265,8 @@ def sync_stock_adjustments_custom(mongo_db, pg_conn, default_cron_query, branch_
         headers, items = [], []
         for doc in docs:
             header, doc_items = _build_stock_adjustment_rows(
-                doc, branch_to_org, org_to_branch, salesman_names, account_codes, now)
+                doc, branch_to_org, org_to_branch, salesman_names, account_codes, now,
+                header_limits, item_limits)
             headers.append(header)
             items.extend(doc_items)
 
