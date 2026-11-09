@@ -1031,9 +1031,13 @@ def sync_collection(
             if pg_table_name == "transaction_fixings" and "total_value" in pg_columns_schema:
                 fixing_orders = doc.get("orders") or []
                 if isinstance(fixing_orders, list):
-                    row_data["total_value"] = round(sum(
-                        float(o.get("price") or 0) for o in fixing_orders if isinstance(o, dict)
-                    ), 4)
+                    # Too big for numeric(p,s) -> NULL + warning, not a failed batch.
+                    row_data["total_value"] = clean_and_serialize(
+                        round(sum(
+                            clean_and_serialize(o.get("price"), "numeric", float("inf")) or 0
+                            for o in fixing_orders if isinstance(o, dict)
+                        ), 4),
+                        "numeric", numeric_limits.get("total_value", 1e12))
             
             if pg_table_name == "contacts" and "country" in pg_columns_schema:
                 addr = doc.get("address") or {}
@@ -2425,7 +2429,7 @@ def refresh_postgres_reports(pg_conn):
                 except Exception:
                     pg_conn.rollback()
                     failed = True
-                    logger.exception("Failed to execute %s", fn)
+                    logger.exception("Failed to execute %s", fn, extra=sync_monitor.REPORT_CHECK)
             check_own_stock_rows(cursor)
     except Exception:
         pg_conn.rollback()
