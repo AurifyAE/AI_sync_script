@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 SYNC_OVERLAP_MINUTES    = 10
 SYNC_MAX_WINDOW_MINUTES = int(os.getenv("SYNC_MAX_WINDOW_MINUTES", 1440))
 
+# logger.error(..., extra=REPORT_CHECK): a report data problem, not a failed
+# fetch. It still goes in the alert mail but does not hold back last_success,
+# because re-fetching the same Mongo period cannot fix it.
+REPORT_CHECK = {"report_check": True}
+
 
 def _state_file(name: str) -> str:
     """Last successful run time per pipeline. Kept next to the code (not /tmp)
@@ -71,11 +76,14 @@ class ErrorCollector(logging.Handler):
         super().__init__(level=logging.ERROR)
         self.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         self.records = []
+        self.sync_failed = False
         self.target_logger = target_logger
         target_logger.addHandler(self)
 
     def emit(self, record):
         self.records.append(self.format(record))
+        if not getattr(record, "report_check", False):
+            self.sync_failed = True
 
     def detach(self):
         self.target_logger.removeHandler(self)
@@ -128,11 +136,12 @@ def alert_if_lock_stuck(name: str, lock_file: str, stale_seconds: int, error: Ex
 
 
 def finish_run(name: str, run_started: datetime, error_collector: ErrorCollector):
-    """Errors -> alert mail and keep the old last_success (next run retries
-    this period). Clean run -> move last_success forward."""
+    """Any error -> alert mail. Sync errors also keep the old last_success (next
+    run retries this period). Otherwise move last_success forward."""
     error_collector.detach()
     if error_collector.records:
         send_failure_alert(name, error_collector.records)
+    if error_collector.sync_failed:
         return
     try:
         save_last_success(name, run_started)
