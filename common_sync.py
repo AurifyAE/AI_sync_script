@@ -2386,11 +2386,12 @@ def check_own_stock_rows(cursor):
         for org_id, branch_id, division, pure in cursor.fetchall():
             logger.error(
                 f"  [own_stock_check] Missing ai_own_stock_position row: org {org_id}, "
-                f"branch {branch_id}, division {division}, stock pure weight {pure} g"
+                f"branch {branch_id}, division {division}, stock pure weight {pure} g",
+                extra=sync_monitor.REPORT_CHECK,
             )
     except Exception:
         cursor.connection.rollback()
-        logger.exception("  [own_stock_check] FAILED")
+        logger.exception("  [own_stock_check] FAILED", extra=sync_monitor.REPORT_CHECK)
 
 
 def refresh_postgres_reports(pg_conn):
@@ -2420,7 +2421,7 @@ def refresh_postgres_reports(pg_conn):
                     # log, so the run alert mail picks it up.
                     for notice in pg_conn.notices:
                         if notice.startswith("WARNING"):
-                            logger.error("%s: %s", fn, notice.strip())
+                            logger.error("%s: %s", fn, notice.strip(), extra=sync_monitor.REPORT_CHECK)
                 except Exception:
                     pg_conn.rollback()
                     failed = True
