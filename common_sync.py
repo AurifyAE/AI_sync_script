@@ -1621,6 +1621,20 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
             balances = doc.get("balances") or {}
             if not isinstance(balances, dict): balances = {}
 
+            # 6. Party KYC: only the fields the ERP onboarding badge reads (no identity data)
+            shareholders = doc.get("shareholders") or []
+            if not isinstance(shareholders, list): shareholders = []
+            kyc_shareholders = [
+                {
+                    "contactId": to_str_id(s.get("contactId")),
+                    "kycStatus": s.get("kycStatus"),
+                    "isVerified": s.get("isVerified"),
+                    "roles": s.get("roles"),
+                    "designation": s.get("designation"),
+                }
+                for s in shareholders if isinstance(s, dict)
+            ]
+
             raw_row = {
                 "id": str(doc.get("_id")),
                 "organization_id": to_str_id(doc.get("OrganizationId") or doc.get("organizationId")),
@@ -1645,6 +1659,10 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
                 "vat_status": vat_stat,
                 "vat_number": vat_num,
                 "trade_license_number": trade_lic,
+                "kyc_status": doc.get("kycStatus"),
+                "is_kyc_verified": doc.get("isKycVerified") is True,
+                "kyc_synced_at": doc.get("kycSyncedAt"),
+                "shareholders": kyc_shareholders,
                 "status": doc.get("status"),
                 "is_active": doc.get("isActive", True),
                 "is_deleted": doc.get("isDeleted", False),
