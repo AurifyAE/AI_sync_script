@@ -1664,7 +1664,7 @@ def sync_accounts_custom(mongo_db, pg_conn, default_cron_query):
                 "kyc_synced_at": doc.get("kycSyncedAt"),
                 "shareholders": kyc_shareholders,
                 "status": doc.get("status"),
-                "is_active": doc.get("isActive", True),
+                "is_active": doc.get("isActive", True), 
                 "is_deleted": doc.get("isDeleted", False),
                 "margin_pct": first_limit.get("Margin"),
                 "total_outstanding": balances.get("totalOutstanding"),
@@ -2390,20 +2390,30 @@ def sync_user_branch_roles(mongo_db, pg_conn):
 def check_own_stock_rows(cursor):
     """bug-1015: every branch/division with stock must have an
     ai_own_stock_position row (the AI Deal Strategy reads it). Logs an
-    error per missing row, so the run alert mail reports it."""
+    error per missing row, so the run alert mail reports it.
+    Own Stock groups a stock by MetalStock.metalType (e.g. a stock in the
+    UN division with metal type XAU lands in the GOLD row), so the check
+    maps the division the same way."""
     try:
         cursor.execute("""
-            SELECT b.organization_id, b.branch_id, MAX(b.division_name),
-                   ROUND(SUM(b.pure_weight), 3)
-            FROM ai_stock_balance b
-            WHERE b.division_id IS NOT NULL
+            SELECT s.organization_id, s.branch_id, MAX(s.division_name),
+                   ROUND(SUM(s.pure_weight), 3)
+            FROM (
+                SELECT b.organization_id, b.branch_id, b.pure_weight,
+                       COALESCE(ms.metal_type_id, b.division_id) AS division_id,
+                       COALESCE(NULLIF(TRIM(d.description), ''), b.division_name) AS division_name
+                FROM ai_stock_balance b
+                LEFT JOIN metal_stocks ms ON ms.id = b.stock_id
+                LEFT JOIN divisions d ON d.id = ms.metal_type_id
+            ) s
+            WHERE s.division_id IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1 FROM ai_own_stock_position o
-                  WHERE o.organization_id = b.organization_id
-                    AND o.branch_id = b.branch_id
-                    AND o.division_id = b.division_id)
-            GROUP BY b.organization_id, b.branch_id, b.division_id
-            HAVING ABS(SUM(b.pure_weight)) > 0.001;
+                  WHERE o.organization_id = s.organization_id
+                    AND o.branch_id = s.branch_id
+                    AND o.division_id = s.division_id)
+            GROUP BY s.organization_id, s.branch_id, s.division_id
+            HAVING ABS(SUM(s.pure_weight)) > 0.001;
         """)
         for org_id, branch_id, division, pure in cursor.fetchall():
             logger.error(
